@@ -1,0 +1,1169 @@
+<?php
+
+/**
+ * ---------------------------------------------------------------------
+ *
+ * GLPI - Gestionnaire Libre de Parc Informatique
+ *
+ * http://glpi-project.org
+ *
+ * @copyright 2015-2026 Teclib' and contributors.
+ * @licence   https://www.gnu.org/licenses/gpl-3.0.html
+ *
+ * ---------------------------------------------------------------------
+ *
+ * LICENSE
+ *
+ * This file is part of GLPI.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * ---------------------------------------------------------------------
+ */
+
+namespace tests\units\Glpi\Asset;
+
+use Glpi\Asset\AssetDefinitionManager;
+use Glpi\Asset\Capacity;
+use Glpi\Asset\Capacity\HasHistoryCapacity;
+use Glpi\Asset\CustomFieldDefinition;
+use Glpi\Asset\CustomFieldType\BooleanType;
+use Glpi\Asset\CustomFieldType\DateTimeType;
+use Glpi\Asset\CustomFieldType\DateType;
+use Glpi\Asset\CustomFieldType\DropdownType;
+use Glpi\Asset\CustomFieldType\NumberType;
+use Glpi\Asset\CustomFieldType\StringType;
+use Glpi\Asset\CustomFieldType\TextType;
+use Glpi\Asset\CustomFieldType\URLType;
+use Glpi\DBAL\QueryExpression;
+use Glpi\DBAL\QueryFunction;
+use Glpi\Search\SearchEngine;
+use Glpi\Search\SearchOption;
+use Glpi\Tests\DbTestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+
+class CustomFieldDefinitionTest extends DbTestCase
+{
+    /**
+     * Ensure custom fields are removed from assets when the custom field definition is removed
+     * @return void
+     */
+    public function testCleanDBOnPurge()
+    {
+        $asset_definition = $this->initAssetDefinition(
+            capacities: [
+                new Capacity(name: HasHistoryCapacity::class),
+            ]
+        );
+        $asset_classname = $asset_definition->getAssetClassName();
+
+        $custom_field_definition = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_string',
+            'label' => 'Test string',
+            'type' => StringType::class,
+            'default_value' => 'default',
+        ]);
+
+        $custom_field_definition_2 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_text',
+            'label' => 'Test text',
+            'type' => TextType::class,
+            'default_value' => 'default text',
+        ]);
+
+        $this->assertTrue($asset_definition->getFromDB($asset_definition->getID()));
+
+        $this->assertTrue($asset_definition->update([
+            'id' => $asset_definition->getID(),
+            'fields_display' => [
+                0 => 'name',
+                1 => 'custom_test_string',
+                2 => 'serial',
+            ],
+        ]));
+
+        $asset = $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => 'Test asset',
+            'custom_test_string' => 'value',
+            'custom_test_text' => 'value2',
+        ], ['custom_test_string']);
+
+        $custom_field_definition->delete(['id' => $custom_field_definition->getID()]);
+
+        $asset->getFromDB($asset->getID());
+        $this->assertEquals('{"' . $custom_field_definition_2->getID() . '": "value2"}', $asset->fields['custom_fields']);
+
+        $this->assertTrue($asset_definition->getFromDB($asset_definition->getID()));
+        $fields_display = $asset_definition->getDecodedFieldsField();
+        $this->assertCount(2, $fields_display);
+        $this->assertEquals('name', $fields_display[0]['key']);
+        $this->assertEquals(0, $fields_display[0]['order']);
+        $this->assertEquals('serial', $fields_display[1]['key']);
+        $this->assertEquals(1, $fields_display[1]['order']);
+    }
+
+    public function testGetAllowedDropdownItemtypes()
+    {
+        $allowed_itemtypes = AssetDefinitionManager::getInstance()->getAllowedDropdownItemtypes();
+        $this->assertNotEmpty($allowed_itemtypes);
+        foreach ($allowed_itemtypes as $group => $opts) {
+            $this->assertNotEmpty($opts);
+            $this->assertIsString($group);
+            foreach ($opts as $classname => $label) {
+                $this->assertTrue(is_subclass_of($classname, \CommonDBTM::class));
+                $this->assertNotEmpty($label);
+            }
+        }
+    }
+
+    public static function validateValueProvider()
+    {
+        return [
+            [
+                'field_params' => ['type' => BooleanType::class],
+                'given_value' => 1,
+                'expected_value' => true,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => BooleanType::class],
+                'given_value' => 0,
+                'expected_value' => false,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => BooleanType::class],
+                'given_value' => '0',
+                'expected_value' => false,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => BooleanType::class],
+                'given_value' => 2,
+                'expected_value' => 2,
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => StringType::class],
+                'given_value' => 'test',
+                'expected_value' => 'test',
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => StringType::class],
+                // Longer than 255 characters
+                'given_value' => 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
+                // Truncated to 255 characters
+                'expected_value' => 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstu',
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => StringType::class],
+                'given_value' => 2,
+                'expected_value' => 2,
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => TextType::class],
+                'given_value' => 'test',
+                'expected_value' => 'test',
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => TextType::class],
+                'given_value' => 2,
+                'expected_value' => 2,
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class],
+                'given_value' => 5,
+                'expected_value' => 5,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class],
+                'given_value' => 'test',
+                'expected_value' => 'test',
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class],
+                'given_value' => 5.6,
+                'expected_value' => 5,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class, 'field_options' => ['step' => 0.1]],
+                'given_value' => 5.6,
+                'expected_value' => 5.6,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class, 'field_options' => ['step' => 0.1, 'min' => 6]],
+                'given_value' => 5.6,
+                'expected_value' => 6,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => NumberType::class, 'field_options' => ['step' => 0.1, 'max' => 5]],
+                'given_value' => 5.6,
+                'expected_value' => 5,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => DateType::class],
+                'given_value' => '2021-01-01',
+                'expected_value' => '2021-01-01',
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => DateType::class],
+                'given_value' => 'test',
+                'expected_value' => 'test',
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => DateType::class],
+                'given_value' => '',
+                'expected_value' => null,
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => DateTimeType::class],
+                'given_value' => '2021-01-01 00:00:00',
+                'expected_value' => '2021-01-01 00:00:00',
+                'is_valid' => true,
+            ],
+            [
+                'field_params' => ['type' => DateTimeType::class],
+                'given_value' => '2021-01-01',
+                'expected_value' => '2021-01-01',
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => DateTimeType::class],
+                'given_value' => 'test',
+                'expected_value' => 'test',
+                'is_valid' => false,
+            ],
+            [
+                'field_params' => ['type' => DateTimeType::class],
+                'given_value' => '',
+                'expected_value' => null,
+                'is_valid' => true,
+            ],
+        ];
+    }
+
+    #[DataProvider('validateValueProvider')]
+    public function testValidateValue($field_params, $given_value, $expected_value, $is_valid)
+    {
+        $value = $given_value;
+        $custom_field = new CustomFieldDefinition();
+        $custom_field->fields = $field_params;
+        if (!$is_valid) {
+            $this->expectException(\InvalidArgumentException::class);
+            $custom_field->getFieldType()->normalizeValue($value);
+        } else {
+            $this->assertEquals($expected_value, $custom_field->getFieldType()->normalizeValue($value));
+        }
+    }
+
+    public function testGetEmpty()
+    {
+        $custom_field = new CustomFieldDefinition();
+        $custom_field->getEmpty();
+        $this->assertEmpty($custom_field->fields['field_options']);
+    }
+
+    public function testGetSearchOption()
+    {
+        $opt_id_offset = 45000;
+        $asset_definition = $this->initAssetDefinition(
+            capacities: [
+                new Capacity(name: HasHistoryCapacity::class),
+            ]
+        );
+
+        $custom_field_definition = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_string',
+            'label' => 'Test string',
+            'type' => StringType::class,
+            'default_value' => 'default',
+        ]);
+        $field_id = $custom_field_definition->getID();
+        $opt = $custom_field_definition->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test string', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), 'default')", (string) $opt['computation']);
+        $this->assertEquals('string', $opt['datatype']);
+
+        $custom_field_definition_2 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_text',
+            'label' => 'Test text',
+            'type' => TextType::class,
+            'default_value' => 'default text',
+        ]);
+        $field_id = $custom_field_definition_2->getID();
+        $opt = $custom_field_definition_2->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test text', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), 'default text')", (string) $opt['computation']);
+        $this->assertEquals('text', $opt['datatype']);
+        $this->assertArrayNotHasKey('htmltext', $opt);
+
+        $custom_field_definition_4 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_number',
+            'label' => 'Test number',
+            'type' => NumberType::class,
+            'default_value' => 420,
+        ]);
+        $field_id = $custom_field_definition_4->getID();
+        $opt = $custom_field_definition_4->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test number', $opt['name']);
+        $this->assertEquals("NULLIF(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), '420'), 'null') + 0", (string) $opt['computation']);
+        $this->assertEquals('number', $opt['datatype']);
+        $this->assertEquals(0, $opt['decimals']);
+
+        $custom_field_definition_4b = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_decimal_number',
+            'label' => 'Test decimal number',
+            'type' => NumberType::class,
+            'default_value' => 4.2,
+            'field_options' => ['step' => 0.01],
+        ], ['field_options']); // JSON encoded field cannot be automatically checked
+        $field_id = $custom_field_definition_4b->getID();
+        $opt = $custom_field_definition_4b->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test decimal number', $opt['name']);
+        $this->assertEquals("NULLIF(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), '4.2'), 'null') + 0", (string) $opt['computation']);
+        $this->assertEquals('number', $opt['datatype']);
+        $this->assertEquals(2, $opt['decimals']);
+
+        $custom_field_definition_4c = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_empty_options_number',
+            'label' => 'Test empty options number',
+            'type' => NumberType::class,
+            'field_options' => ['min' => '', 'step' => ''],
+        ], ['field_options']); // JSON encoded field cannot be automatically checked
+        $opt = $custom_field_definition_4c->getFieldType()->getSearchOption();
+        $this->assertEquals('number', $opt['datatype']);
+        $this->assertEquals(0, $opt['decimals']);
+
+        // Values that `(string)` renders in scientific notation, or with floating point noise
+        $decimals_cases = [
+            [['step' => 0.00001], 5],
+            [['step' => 1.5e-7], 8],
+            [['min' => 1e15, 'step' => 1], 0],
+            [['min' => 0.1 + 0.2, 'step' => 1], 1],
+        ];
+        foreach ($decimals_cases as $i => [$field_options, $expected_decimals]) {
+            $definition = $this->createItem(CustomFieldDefinition::class, [
+                'assets_assetdefinitions_id' => $asset_definition->getID(),
+                'system_name' => 'test_decimals_number_' . $i,
+                'label' => 'Test decimals number ' . $i,
+                'type' => NumberType::class,
+                'field_options' => $field_options,
+            ], ['field_options']); // JSON encoded field cannot be automatically checked
+            $opt = $definition->getFieldType()->getSearchOption();
+            $this->assertEquals($expected_decimals, $opt['decimals'], json_encode($field_options));
+        }
+
+        $custom_field_definition_5 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_date',
+            'label' => 'Test date',
+            'type' => DateType::class,
+            'default_value' => '2021-01-01',
+        ]);
+        $field_id = $custom_field_definition_5->getID();
+        $opt = $custom_field_definition_5->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test date', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), '2021-01-01')", (string) $opt['computation']);
+        $this->assertEquals('date', $opt['datatype']);
+
+        $custom_field_definition_6 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_datetime',
+            'label' => 'Test datetime',
+            'type' => DateTimeType::class,
+            'default_value' => '2021-01-01 03:25:15',
+        ]);
+        $field_id = $custom_field_definition_6->getID();
+        $opt = $custom_field_definition_6->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test datetime', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), '2021-01-01 03:25:15')", (string) $opt['computation']);
+        $this->assertEquals('datetime', $opt['datatype']);
+
+        $custom_field_definition_7 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_dropdown',
+            'label' => 'Test dropdown',
+            'type' => DropdownType::class,
+            'itemtype' => \Computer::class,
+            'default_value' => '2',
+        ]);
+        $field_id = $custom_field_definition_7->getID();
+        $opt = $custom_field_definition_7->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test dropdown', $opt['name']);
+
+        $custom_field_definition_8 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_url',
+            'label' => 'Test url',
+            'type' => URLType::class,
+            'default_value' => 'https://glpi-project.org',
+        ]);
+        $field_id = $custom_field_definition_8->getID();
+        $opt = $custom_field_definition_8->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test url', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), 'https://glpi-project.org')", (string) $opt['computation']);
+        $this->assertEquals('string', $opt['datatype']);
+
+        $custom_field_definition_9 = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_bool',
+            'label' => 'Test bool',
+            'type' => BooleanType::class,
+            'default_value' => '1',
+        ]);
+        $field_id = $custom_field_definition_9->getID();
+        $opt = $custom_field_definition_9->getFieldType()->getSearchOption();
+        $this->assertEquals($opt_id_offset + $field_id, $opt['id']);
+        $this->assertEquals('Test bool', $opt['name']);
+        $this->assertEquals("COALESCE(JSON_UNQUOTE(JSON_EXTRACT(`glpi_assets_assets`.`custom_fields`, '$.\\\"{$field_id}\\\"')), '1') = 'true'", (string) $opt['computation']);
+        $this->assertEquals('bool', $opt['datatype']);
+    }
+
+    public function testSystemNameUnqiue()
+    {
+        $asset_definition = $this->initAssetDefinition();
+
+        $field = new CustomFieldDefinition();
+
+        $this->assertGreaterThan(0, $field->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test',
+            'label' => 'Test',
+            'type' => StringType::class,
+            'default_value' => 'default',
+        ]));
+
+        $this->assertFalse($field->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test',
+            'label' => 'Test',
+            'type' => StringType::class,
+            'default_value' => 'default',
+        ]));
+
+        $this->hasSessionMessages(ERROR, ['The system name must be unique among fields for this asset definition']);
+    }
+
+    /**
+     * Date and datetime fields should be stored in the database in UTC/GMT and then converted to the user's timezone when read from the database
+     */
+    public function testDateTimezones()
+    {
+        global $DB;
+
+        $original_tz = date_default_timezone_get();
+        // Hack to prevent the script tz from being changed by the DB access layer
+        $DB->use_timezones = true;
+        date_default_timezone_set('Etc/GMT-2'); // This is actually ahead of GMT by 2 hours because it uses the POSIX format
+
+        $asset_definition = $this->initAssetDefinition();
+
+        $field = new CustomFieldDefinition();
+
+        $fields_id = $field->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_datetime',
+            'label' => 'Test datetime',
+            'type' => DateTimeType::class,
+            'default_value' => '2021-01-01 03:25:15',
+        ]);
+
+        $asset = new ($asset_definition->getAssetClassName());
+        $asset->add([
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => 'Test asset',
+            'custom_test_datetime' => '2024-04-05 07:25:15',
+        ]);
+
+        // Ensure the values are stored in the database in UTC
+        $it = $DB->request([
+            'SELECT' => ['default_value'],
+            'FROM' => $field::getTable(),
+            'WHERE' => ['id' => $fields_id],
+        ]);
+        $this->assertEquals(json_encode('2021-01-01 01:25:15'), $it->current()['default_value']);
+
+        $it = $DB->request([
+            'SELECT' => [
+                QueryFunction::jsonUnquote(
+                    expression: QueryFunction::jsonExtract([
+                        'glpi_assets_assets.custom_fields',
+                        new QueryExpression($DB::quoteValue('$."' . $fields_id . '"')),
+                    ]),
+                    alias: 'value'
+                ),
+            ],
+            'FROM' => $asset::getTable(),
+            'WHERE' => ['id' => $asset->getID()],
+        ]);
+        $this->assertEquals('2024-04-05 05:25:15', $it->current()['value']);
+
+        // Ensure the values are converted to the user's timezone when read from the database
+        $field->getFromDB($fields_id);
+        $this->assertEquals('2021-01-01 03:25:15', $field->fields['default_value']);
+        $asset->getFromDB($asset->getID());
+        $this->assertEquals('2024-04-05 07:25:15', $asset->fields['custom_test_datetime']);
+
+        date_default_timezone_set($original_tz);
+    }
+
+    public function testCustomFieldHistory()
+    {
+        $asset_definition = $this->initAssetDefinition(
+            capacities: [
+                new Capacity(name: HasHistoryCapacity::class),
+            ]
+        );
+        $field_1 = new CustomFieldDefinition();
+        $field_2 = new CustomFieldDefinition();
+
+        $field_1->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test',
+            'label' => 'Test',
+            'type' => StringType::class,
+            'default_value' => 'default',
+        ]);
+        $field_2->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test_two',
+            'label' => 'Test2',
+            'type' => DropdownType::class,
+            'itemtype' => \Computer::class,
+        ]);
+
+        $asset = new ($asset_definition->getAssetClassName());
+        $asset->add([
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => 'Test asset',
+        ]);
+
+        $asset->update([
+            'id' => $asset->getID(),
+            'custom_test' => 'value',
+            'custom_test_two' => getItemByTypeName(\Computer::class, '_test_pc01', true),
+        ]);
+
+        $this->assertEquals(1, countElementsInTable(\Log::getTable(), [
+            'itemtype' => $asset_definition->getAssetClassName(),
+            'items_id' => $asset->getID(),
+            'id_search_option' => $field_1->getSearchOptionID(),
+            'old_value' => 'default',
+            'new_value' => 'value',
+        ]));
+
+        $this->assertEquals(1, countElementsInTable(\Log::getTable(), [
+            'itemtype' => $asset_definition->getAssetClassName(),
+            'items_id' => $asset->getID(),
+            'id_search_option' => $field_2->getSearchOptionID(),
+            'old_value' => '',
+            'new_value' => '_test_pc01',
+        ]));
+    }
+
+    public function testAddTranslationsOnCreate()
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $field = new CustomFieldDefinition();
+        $this->assertGreaterThan(0, $field->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test',
+            'label' => 'Test',
+            'type' => StringType::class,
+            'translations' => [
+                'fr_FR' => 'test_fr',
+            ],
+        ]));
+        $_SESSION['glpilanguage'] = 'fr_FR';
+        $this->assertEquals('test_fr', $field->getFriendlyName());
+    }
+
+    public function testAddTranslationsOnUpdate()
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $field = new CustomFieldDefinition();
+        $this->assertGreaterThan(0, $field->add([
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'test',
+            'label' => 'Test',
+            'type' => StringType::class,
+        ]));
+        $this->assertTrue($field->update([
+            'id' => $field->getID(),
+            'translations' => [
+                'fr_FR' => 'test_fr',
+            ],
+        ]));
+        $_SESSION['glpilanguage'] = 'fr_FR';
+        $this->assertEquals('test_fr', $field->getFriendlyName());
+    }
+
+    public function testSystemNameUpdate(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+
+        $field = $this->createItem(
+            CustomFieldDefinition::class,
+            [
+                'assets_assetdefinitions_id' => $asset_definition->getID(),
+                'system_name' => 'test',
+                'type' => StringType::class,
+            ]
+        );
+
+        $updated = $field->update([
+            'id' => $field->getID(),
+            'system_name' => 'changed',
+        ]);
+        $this->assertFalse($updated);
+        $this->hasSessionMessages(ERROR, ['The system name cannot be changed.']);
+    }
+
+    public function testTypeUpdate(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+
+        $field = $this->createItem(
+            CustomFieldDefinition::class,
+            [
+                'assets_assetdefinitions_id' => $asset_definition->getID(),
+                'system_name' => 'test',
+                'type' => StringType::class,
+            ]
+        );
+
+        $updated = $field->update([
+            'id' => $field->getID(),
+            'type' => BooleanType::class,
+        ]);
+        $this->assertFalse($updated);
+        $this->hasSessionMessages(ERROR, ['The field type cannot be changed.']);
+    }
+
+    public function testSearchDropdownField(): void
+    {
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype('Glpi\\CustomAsset\\Test01Asset');
+        $single_dropdown_opt = null;
+        $multiple_dropdown_opt = null;
+
+        foreach ($opts as $num => $opt) {
+            if (!is_array($opt)) {
+                continue;
+            }
+            if ($opt['name'] === 'Single Custom Tag') {
+                $single_dropdown_opt = $num;
+            } elseif ($opt['name'] === 'Multi Custom Tag') {
+                $multiple_dropdown_opt = $num;
+            }
+        }
+        $this->assertNotNull($single_dropdown_opt);
+        $this->assertNotNull($multiple_dropdown_opt);
+
+        $this->createItem('Glpi\\CustomAsset\\Test01Asset', [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__,
+            'custom_customtagsingle' => getItemByTypeName('Glpi\\CustomDropdown\\CustomTagDropdown', 'Tag01', true),
+            'custom_customtagmulti' => [
+                getItemByTypeName('Glpi\\CustomDropdown\\CustomTagDropdown', 'Tag01', true),
+                getItemByTypeName('Glpi\\CustomDropdown\\CustomTagDropdown', 'Tag02', true),
+            ],
+        ], ['custom_customtagsingle', 'custom_customtagmulti']);
+
+        $data = SearchEngine::getData('Glpi\\CustomAsset\\Test01Asset', [
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => 'name',
+                    'searchtype' => 'equals',
+                    'value' => __FUNCTION__,
+                ],
+                [
+                    'link' => 'OR',
+                    'field' => $single_dropdown_opt,
+                    'searchtype' => 'contains',
+                    'value' => 'Tag',
+                ],
+                [
+                    'link' => 'OR',
+                    'field' => $multiple_dropdown_opt,
+                    'searchtype' => 'contains',
+                    'value' => 'Tag',
+                ],
+            ],
+        ], [$single_dropdown_opt, $multiple_dropdown_opt]);
+
+        $this->assertCount(1, $data['data']['rows']);
+        $row = reset($data['data']['rows'])['raw'];
+        $this->assertEquals(
+            'Tag01',
+            $row['ITEM_Glpi\\CustomAsset\\Test01Asset_' . $single_dropdown_opt]
+        );
+        $this->assertEquals(
+            'Tag01$#$1$$##$$Tag02$#$2',
+            $row['ITEM_Glpi\\CustomAsset\\Test01Asset_' . $multiple_dropdown_opt]
+        );
+    }
+
+    public function testSearchBooleanField(): void
+    {
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype('Glpi\\CustomAsset\\Test01Asset');
+        $boolean_opt = null;
+
+        foreach ($opts as $num => $opt) {
+            if (!is_array($opt)) {
+                continue;
+            }
+            if ($opt['name'] === 'Test Boolean') {
+                $boolean_opt = $num;
+                break;
+            }
+        }
+        $this->assertNotNull($boolean_opt);
+
+        $this->createItem('Glpi\\CustomAsset\\Test01Asset', [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_yes',
+            'custom_testboolean' => true,
+        ], ['custom_testboolean']);
+
+        $this->createItem('Glpi\\CustomAsset\\Test01Asset', [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_no',
+            'custom_testboolean' => false,
+        ], ['custom_testboolean']);
+
+        $this->createItem('Glpi\\CustomAsset\\Test01Asset', [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_default',
+        ]);
+
+        $data = SearchEngine::getData('Glpi\\CustomAsset\\Test01Asset', [
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => 1,
+                    'searchtype' => 'contains',
+                    'value' => __FUNCTION__,
+                ],
+            ],
+        ], [$boolean_opt]);
+
+        $this->assertCount(3, $data['data']['rows']);
+        foreach ($data['data']['rows'] as $row) {
+            $raw = $row['raw'];
+            $name = $raw['ITEM_Glpi\\CustomAsset\\Test01Asset_1'];
+            $this->assertEquals($name === __FUNCTION__ . '_yes' ? 1 : 0, $raw['ITEM_Glpi\\CustomAsset\\Test01Asset_' . $boolean_opt]);
+        }
+    }
+
+    public function testSearchDecimalNumberField(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $asset_classname  = $asset_definition->getAssetClassName();
+
+        $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'decimalnumber',
+            'label' => 'Decimal number',
+            'type' => NumberType::class,
+            'field_options' => ['step' => 0.01],
+        ], ['field_options']); // JSON encoded field cannot be automatically checked
+
+        // Login after the definition creation to get the corresponding rights in the session
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype($asset_classname);
+        $number_opt = null;
+        foreach ($opts as $num => $opt) {
+            if (is_array($opt) && $opt['name'] === 'Decimal number') {
+                $number_opt = $num;
+                break;
+            }
+        }
+        $this->assertNotNull($number_opt);
+
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__,
+            'custom_decimalnumber' => 12.75,
+        ], ['custom_decimalnumber']);
+
+        $data = SearchEngine::getData($asset_classname, [
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => 1,
+                    'searchtype' => 'contains',
+                    'value' => __FUNCTION__,
+                ],
+            ],
+        ], [$number_opt]);
+
+        $this->assertCount(1, $data['data']['rows']);
+        $row = reset($data['data']['rows']);
+        $this->assertEquals(12.75, $row['raw']['ITEM_' . $asset_classname . '_' . $number_opt]);
+        $this->assertStringContainsString('12.75', $row[$asset_classname . '_' . $number_opt]['displayname']);
+
+        // Search criteria on the decimal field itself
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_whole',
+            'custom_decimalnumber' => 12,
+        ], ['custom_decimalnumber']);
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_other',
+            'custom_decimalnumber' => 112.79,
+        ], ['custom_decimalnumber']);
+
+        $expected_results = [
+            ['contains', '12', [__FUNCTION__ . '_whole']],
+            ['contains', '12.75', [__FUNCTION__]],
+            ['equals', '12', [__FUNCTION__ . '_whole']],
+            ['equals', '12.75', [__FUNCTION__]],
+        ];
+        foreach ($expected_results as [$searchtype, $value, $expected_names]) {
+            $data = SearchEngine::getData($asset_classname, [
+                'criteria' => [
+                    [
+                        'link' => 'AND',
+                        'field' => 1,
+                        'searchtype' => 'contains',
+                        'value' => __FUNCTION__,
+                    ],
+                    [
+                        'link' => 'AND',
+                        'field' => $number_opt,
+                        'searchtype' => $searchtype,
+                        'value' => $value,
+                    ],
+                ],
+            ], [1, $number_opt]);
+            $names = array_map(
+                static fn($row) => $row['raw']['ITEM_' . $asset_classname . '_1'],
+                $data['data']['rows']
+            );
+            sort($names);
+            $this->assertEquals($expected_names, $names, "Search '{$searchtype}' '{$value}'");
+        }
+    }
+
+    public function testSortDecimalNumberField(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $asset_classname  = $asset_definition->getAssetClassName();
+
+        $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'decimalnumber',
+            'label' => 'Decimal number',
+            'type' => NumberType::class,
+            'field_options' => ['step' => 0.01],
+        ], ['field_options']); // JSON encoded field cannot be automatically checked
+
+        // Login after the definition creation to get the corresponding rights in the session
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype($asset_classname);
+        $number_opt = null;
+        foreach ($opts as $num => $opt) {
+            if (is_array($opt) && $opt['name'] === 'Decimal number') {
+                $number_opt = $num;
+                break;
+            }
+        }
+        $this->assertNotNull($number_opt);
+
+        // Values whose alphabetical order ("100" < "112.79" < "12.75") differs from their numeric order
+        foreach ([100, 112.79, 12.75] as $value) {
+            $this->createItem($asset_classname, [
+                'entities_id' => $this->getTestRootEntity(true),
+                'name' => __FUNCTION__ . '_' . $value,
+                'custom_decimalnumber' => $value,
+            ], ['custom_decimalnumber']);
+        }
+
+        foreach (['ASC' => [12.75, 100.0, 112.79], 'DESC' => [112.79, 100.0, 12.75]] as $order => $expected_values) {
+            $data = SearchEngine::getData($asset_classname, [
+                'criteria' => [
+                    [
+                        'link' => 'AND',
+                        'field' => 1,
+                        'searchtype' => 'contains',
+                        'value' => __FUNCTION__,
+                    ],
+                ],
+                'sort' => [$number_opt],
+                'order' => [$order],
+            ], [1, $number_opt]);
+            $values = array_map(
+                static fn($row) => (float) $row['raw']['ITEM_' . $asset_classname . '_' . $number_opt],
+                $data['data']['rows']
+            );
+            $this->assertSame($expected_values, $values, "Sort {$order}");
+        }
+    }
+
+    public function testSearchClearedNumberField(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $asset_classname  = $asset_definition->getAssetClassName();
+
+        $field = $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'clearednumber',
+            'label' => 'Cleared number',
+            'type' => NumberType::class,
+            'default_value' => 7, // a cleared value must be displayed empty, not with the default value
+        ]);
+
+        // Login after the definition creation to get the corresponding rights in the session
+        $this->login();
+
+        $number_opt = $field->getSearchOptionID();
+
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_set',
+            'custom_clearednumber' => 5,
+        ], ['custom_clearednumber']);
+        $cleared = $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_cleared',
+            'custom_clearednumber' => 3,
+        ], ['custom_clearednumber']);
+        $this->updateItem($asset_classname, $cleared->getID(), ['custom_clearednumber' => ''], ['custom_clearednumber']);
+
+        // Clearing the field stores a JSON null
+        $cleared->getFromDB($cleared->getID());
+        $this->assertSame([$field->getID() => null], json_decode($cleared->fields['custom_fields'], true));
+
+        $data = SearchEngine::getData($asset_classname, [
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => 1,
+                    'searchtype' => 'contains',
+                    'value' => __FUNCTION__ . '_cleared',
+                ],
+            ],
+        ], [1, $number_opt]);
+        $this->assertCount(1, $data['data']['rows']);
+        $row = reset($data['data']['rows']);
+        $this->assertNull($row['raw']['ITEM_' . $asset_classname . '_' . $number_opt]);
+
+        // A cleared value must not be considered as 0
+        $data = SearchEngine::getData($asset_classname, [
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => 1,
+                    'searchtype' => 'contains',
+                    'value' => __FUNCTION__,
+                ],
+                [
+                    'link' => 'AND',
+                    'field' => $number_opt,
+                    'searchtype' => 'lessthan',
+                    'value' => 1,
+                ],
+            ],
+        ], [1, $number_opt]);
+        $this->assertCount(0, $data['data']['rows']);
+    }
+
+    /**
+     * A dropdown custom field may target another custom asset.
+     * In this case, the joined table is the same as the main itemtype table, and the
+     * table alias must be computed the same way in every part of the search query.
+     *
+     * @see https://github.com/glpi-project/glpi/issues/25026
+     */
+    public function testSearchDropdownFieldOnCustomAsset(): void
+    {
+        $linked_itemtype  = 'Glpi\\CustomAsset\\Test02Asset';
+        $asset_definition = $this->initAssetDefinition();
+        $asset_classname  = $asset_definition->getAssetClassName();
+
+        $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'singlelinkedasset',
+            'label' => 'Single linked asset',
+            'type' => DropdownType::class,
+            'itemtype' => $linked_itemtype,
+        ]);
+        $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'multilinkedasset',
+            'label' => 'Multiple linked assets',
+            'type' => DropdownType::class,
+            'itemtype' => $linked_itemtype,
+            'field_options' => ['multiple' => '1'],
+        ], ['field_options']); // JSON encoded field cannot be automatically checked
+
+        // Login after the definition creation to get the corresponding rights in the session
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype($asset_classname);
+        $single_dropdown_opt = null;
+        $multiple_dropdown_opt = null;
+        foreach ($opts as $num => $opt) {
+            if (!is_array($opt)) {
+                continue;
+            }
+            if ($opt['name'] === 'Single linked asset') {
+                $single_dropdown_opt = $num;
+            } elseif ($opt['name'] === 'Multiple linked assets') {
+                $multiple_dropdown_opt = $num;
+            }
+        }
+        $this->assertNotNull($single_dropdown_opt);
+        $this->assertNotNull($multiple_dropdown_opt);
+
+        $linked_a = getItemByTypeName($linked_itemtype, 'Test02 A', true);
+        $linked_b = getItemByTypeName($linked_itemtype, 'Test02 B', true);
+
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__,
+            'custom_singlelinkedasset' => $linked_a,
+            'custom_multilinkedasset' => [$linked_a, $linked_b],
+        ], ['custom_singlelinkedasset', 'custom_multilinkedasset']);
+
+        $data = SearchEngine::getData($asset_classname, [
+            'sort' => [$single_dropdown_opt],
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => $single_dropdown_opt,
+                    'searchtype' => 'contains',
+                    'value' => 'Test02 A',
+                ],
+                [
+                    'link' => 'AND',
+                    'field' => $multiple_dropdown_opt,
+                    'searchtype' => 'contains',
+                    'value' => 'Test02',
+                ],
+            ],
+        ], [$single_dropdown_opt, $multiple_dropdown_opt]);
+
+        $this->assertCount(1, $data['data']['rows']);
+        $row = reset($data['data']['rows'])['raw'];
+        $this->assertEquals('Test02 A', $row['ITEM_' . $asset_classname . '_' . $single_dropdown_opt]);
+        $this->assertEquals(
+            'Test02 A$#$' . $linked_a . '$$##$$Test02 B$#$' . $linked_b,
+            $row['ITEM_' . $asset_classname . '_' . $multiple_dropdown_opt]
+        );
+    }
+
+    /**
+     * A dropdown custom field may target the custom asset's own itemtype (self-reference).
+     * In this case, the joined table alias is the same for the JOIN, SELECT, WHERE and
+     * ORDER BY clauses, and they must all be computed the same way.
+     *
+     * @see https://github.com/glpi-project/glpi/issues/25026
+     */
+    public function testSearchDropdownFieldOnCustomAssetSelfReference(): void
+    {
+        $asset_definition = $this->initAssetDefinition();
+        $asset_classname  = $asset_definition->getAssetClassName();
+
+        $this->createItem(CustomFieldDefinition::class, [
+            'assets_assetdefinitions_id' => $asset_definition->getID(),
+            'system_name' => 'linkedasset',
+            'label' => 'Linked asset',
+            'type' => DropdownType::class,
+            'itemtype' => $asset_classname,
+        ]);
+
+        // Login after the definition creation to get the corresponding rights in the session
+        $this->login();
+
+        $opts = SearchOption::getOptionsForItemtype($asset_classname);
+        $dropdown_opt = null;
+        foreach ($opts as $num => $opt) {
+            if (is_array($opt) && $opt['name'] === 'Linked asset') {
+                $dropdown_opt = $num;
+            }
+        }
+        $this->assertNotNull($dropdown_opt);
+
+        $linked_id = $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_linked',
+        ])->getID();
+
+        $this->createItem($asset_classname, [
+            'entities_id' => $this->getTestRootEntity(true),
+            'name' => __FUNCTION__ . '_main',
+            'custom_linkedasset' => $linked_id,
+        ], ['custom_linkedasset']);
+
+        // Filtering (WHERE) and sorting (ORDER BY) on the self-referencing field must not
+        // trigger a "Unknown column" SQL error caused by a mismatched table alias.
+        $data = SearchEngine::getData($asset_classname, [
+            'sort' => [$dropdown_opt],
+            'criteria' => [
+                [
+                    'link' => 'AND',
+                    'field' => $dropdown_opt,
+                    'searchtype' => 'contains',
+                    'value' => __FUNCTION__ . '_linked',
+                ],
+            ],
+        ], [$dropdown_opt]);
+
+        $this->assertCount(1, $data['data']['rows']);
+        $row = reset($data['data']['rows'])['raw'];
+        $this->assertEquals(
+            __FUNCTION__ . '_linked',
+            $row['ITEM_' . $asset_classname . '_' . $dropdown_opt]
+        );
+    }
+}
